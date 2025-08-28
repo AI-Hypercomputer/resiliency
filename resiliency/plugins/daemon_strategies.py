@@ -76,9 +76,7 @@ class DaemonTorchDistSaveShardedStrategy(TorchDistSaveShardedStrategy):
 
   def save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
     """Each async strategy can be trivially used as a sync strategy."""
-    async_request = self.async_save(
-        sharded_state_dict, checkpoint_dir
-    )
+    async_request = self.async_save(sharded_state_dict, checkpoint_dir)
     async_request.async_fn(*async_request.async_fn_args)
     for finalize_fn in async_request.finalize_fns:
       finalize_fn()

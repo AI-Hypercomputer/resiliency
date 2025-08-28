@@ -18,10 +18,14 @@ from typing import Any, Dict, Optional
 from lightning.fabric.utilities.cloud_io import get_filesystem
 from lightning.fabric.utilities.types import _PATH
 from megatron.core.dist_checkpointing.mapping import apply_factories
+from megatron.core.dist_checkpointing.serialization import (
+    get_default_save_sharded_strategy,
+)
 from megatron.core.dist_checkpointing.state_dict_transformation import save_preprocess
 from megatron.core.dist_checkpointing.strategies.fully_parallel import (
     FullyParallelSaveStrategyWrapper,
 )
+from megatron.core.parallel_state import get_data_parallel_group
 from nemo.utils import logging
 from nemo.utils.callbacks.dist_ckpt_io import DistributedCheckpointIO
 from resiliency.third_party.megatron.async_utils import AsyncRequest, debug_time
@@ -126,7 +130,6 @@ class MinCkptOverheadCheckpointIO(DistributedCheckpointIO):
             None,
             None,
             False,
-            storage_options["is_persistent_storage"],
         ),
         finalize_fns=[finalize_fn],
     )

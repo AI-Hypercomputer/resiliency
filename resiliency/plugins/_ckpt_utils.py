@@ -88,6 +88,7 @@ def find_latest_checkpoint_path(
   # Determine the maximum step and corresponding path
   max_step, max_step_path = -1, None
   for checkpoint_dir in checkpoint_dirs:
+    curr_dir_max_step, curr_dir_max_step_path = -1, None
     if checkpoint_dir is None:
       continue
     if not isinstance(checkpoint_dir, Path) and not isinstance(
@@ -105,10 +106,16 @@ def find_latest_checkpoint_path(
         continue
       if re.match(r"^step=\d+$", path.name):
         step = int(re.search(r"step=(-?\d+)", str(path)).group(1))
-        if step > max_step:
-          max_step = step
-          max_step_path = path
-    logger.info(f"{checkpoint_dir} found latest checkpoint path {max_step_path}")
+        if step > curr_dir_max_step:
+          curr_dir_max_step = step
+          curr_dir_max_step_path = path
+    logger.info(
+        f"In {checkpoint_dir}, found latest checkpoint path"
+        f" {curr_dir_max_step_path}"
+    )
+    if curr_dir_max_step > max_step:
+      max_step = curr_dir_max_step
+      max_step_path = curr_dir_max_step_path
 
   if synchronize:
     # Synchronize the max step and path across all processes
@@ -121,7 +128,7 @@ def find_latest_checkpoint_path(
     all_procs_max_steps = [-1] * dist.get_world_size()
     all_procs_max_step_paths = [None] * dist.get_world_size()
     dist.all_gather_object(all_procs_max_steps, max_step)
-    dist.all_gather_object(all_procs_max_step_paths, max_step_path)
+    dist.all_gather_object(all_procs_max_step_paths, str(max_step_path))
 
     # Find the global max step across all processes
     global_max_step = max(all_procs_max_steps)
@@ -130,6 +137,7 @@ def find_latest_checkpoint_path(
       max_step_process_idx = all_procs_max_steps.index(global_max_step)
       # Get the path from that process
       max_step_path = all_procs_max_step_paths[max_step_process_idx]
+      max_step_path = Path(max_step_path)
     else:
       max_step_path = None
 
@@ -139,10 +147,9 @@ def find_latest_checkpoint_path(
 
 def get_is_checkpoint_file_handler(
     is_cluster_local_checkpointing: bool = False,
-    is_persistent_storage: bool = False,
 ):
   rank = int(os.getenv("RANK"))
-  if is_cluster_local_checkpointing and not is_persistent_storage:
+  if is_cluster_local_checkpointing:
     local_world_size = int(os.getenv("LOCAL_WORLD_SIZE", 8))
     local_rank = int(os.getenv("LOCAL_RANK", rank % local_world_size))
     return local_rank == 0
@@ -184,7 +191,6 @@ class _MegatronCompatibleAsyncCheckpointProcess(_AsyncCheckpointProcess):
       storage_writer: Optional[StorageWriter] = None,
       planner: Optional[SavePlanner] = None,
       use_in_cluster_local_ckpts: bool = False,
-      storage_options: Optional[Any] = None,
   ) -> None:
     thread_count = state_dict.pop("thread_count")
 
@@ -193,7 +199,6 @@ class _MegatronCompatibleAsyncCheckpointProcess(_AsyncCheckpointProcess):
         checkpoint_dir=checkpoint_request_id.checkpoint_id,
         sharded_strategy=sharded_strategy,
         use_in_cluster_local_ckpts=use_in_cluster_local_ckpts,
-        is_persistent_storage=storage_options,
     )
 
   @staticmethod
@@ -334,7 +339,6 @@ def save(
         [CommonStateDict], StateDict
     ] = None,
     use_in_cluster_local_ckpts: bool = False,
-    is_persistent_storage: bool = False,
 ) -> Optional[AsyncRequest]:
   """Saving entrypoint.
 
@@ -376,8 +380,6 @@ def save(
         state dict (i.e can be used  to remove keys that we expect to be
         different in the state dict). The function must not modify the original
         state dict
-      is_persistent_storage (bool, optional): if True, the checkpoint is
-        considered to be saved to persistent storage.
 
   Returns:
       AsyncRequest (optional): if `async_sharded_save` is True, returns
@@ -386,9 +388,7 @@ def save(
   """
   checkpoint_dir = Path(checkpoint_dir)
 
-  if get_is_checkpoint_file_handler(
-      use_in_cluster_local_ckpts, is_persistent_storage
-  ):
+  if get_is_checkpoint_file_handler(use_in_cluster_local_ckpts):
     if not checkpoint_dir.exists():
       raise CheckpointingException(
           f"Checkpoint destination directory does not exist: {checkpoint_dir}"
@@ -396,7 +396,7 @@ def save(
       )
 
   if not use_in_cluster_local_ckpts and get_is_checkpoint_file_handler(
-      use_in_cluster_local_ckpts, is_persistent_storage
+      use_in_cluster_local_ckpts
   ):
     if next(checkpoint_dir.iterdir(), None) is not None:
       raise CheckpointingException(
@@ -430,7 +430,7 @@ def save(
         validate_access_integrity,
         preprocess_common_before_consistancy_check,
     )
-  if use_in_cluster_local_ckpts and not is_persistent_storage:
+  if use_in_cluster_local_ckpts:
     sharded_strategy.save_common(common_state_dict, checkpoint_dir)
   else:
     common_strategy.save_common(common_state_dict, checkpoint_dir)
@@ -445,9 +445,7 @@ def save(
     )
 
   def metadata_finalize_fn():
-    if get_is_checkpoint_file_handler(
-        use_in_cluster_local_ckpts, is_persistent_storage
-    ):
+    if get_is_checkpoint_file_handler(use_in_cluster_local_ckpts):
       save_config(
           CheckpointingConfig(
               sharded_strategy.backend, sharded_strategy.version

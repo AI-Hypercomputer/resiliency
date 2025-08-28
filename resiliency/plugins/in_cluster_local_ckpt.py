@@ -14,9 +14,9 @@ limitations under the License.
 """
 
 from collections import ChainMap
-import os
 import dataclasses
 import io
+import os
 from pathlib import Path
 from time import time
 from typing import Any, Dict, List, Optional, Set, Tuple, Union, cast
@@ -126,10 +126,14 @@ class InClusterLocalCheckpointIO(DistributedCheckpointIO):
       async_save: bool = False,
       torch_dist_multiproc: Optional[int] = None,
       assume_constant_structure: bool = False,
-      parallel_save: bool = False,
-      parallel_save_within_dp: bool = False,
-      parallel_load: bool = False,
+      persistent_parallel_save: bool = False,
+      persistent_parallel_save_within_dp: bool = False,
+      persistent_parallel_load: bool = False,
+      local_parallel_save: bool = False,
+      local_parallel_save_within_dp: bool = False,
+      local_parallel_load: bool = False,
       use_ckpt_load_replication: bool = False,
+      local_ckpt_dir: Optional[str] = None,
   ):
     super().__init__(
         save_ckpt_format,
@@ -138,13 +142,35 @@ class InClusterLocalCheckpointIO(DistributedCheckpointIO):
         async_save,
         torch_dist_multiproc,
         assume_constant_structure,
-        parallel_save,
-        parallel_save_within_dp,
-        parallel_load,
     )
 
+    # Initialize sharded strategies for persistent and local storage
+    self._local_save_sharded_strategy = None
+    self._persistent_save_sharded_strategy = None
+
+    # Unset the default parallel save/load flags
+    self.parallel_save = None
+    self.parallel_save_within_dp = None
+    self.parallel_load = None
+
+    # Set parallel save/load flags for persistent and local storage
+    self.persistent_parallel_save = persistent_parallel_save
+    self.persistent_parallel_save_within_dp = persistent_parallel_save_within_dp
+    self.persistent_parallel_load = persistent_parallel_load
+    self.local_parallel_save = local_parallel_save
+    self.local_parallel_save_within_dp = local_parallel_save_within_dp
+    self.local_parallel_load = local_parallel_load
+
+    # Set parallel_load flag to persistent_parallel_load since persistent parallel load is handled by parent class
+    self.parallel_load = self.persistent_parallel_load
+
+    # Initialize flags for replication and local checkpoint directory
     self.use_ckpt_load_replication = use_ckpt_load_replication
     self.replication_coordinator = None
+    self.local_ckpt_dir = local_ckpt_dir
+
+    # Flag to indicate if saving to persistent storage
+    self._save_to_persistent_storage = False
 
   @debug_time("InClusterLocalCheckpointIO.save_checkpoint")
   def save_checkpoint(
@@ -163,14 +189,20 @@ class InClusterLocalCheckpointIO(DistributedCheckpointIO):
         storage_options (Any, optional): Optional parameters when saving the
           checkpoint
     """
-    use_in_cluster_local_ckpts=True
-    is_persistent_storage=storage_options.get("is_persistent_storage", False)
+    is_persistent_storage = storage_options.get("is_persistent_storage", False)
+
+    # Defer to super().save_checkpoint when saving to persistent storage
+    if is_persistent_storage:
+      logger.debug("Saving checkpoint to persistent storage.")
+      self._save_to_persistent_storage = True
+      return super().save_checkpoint(checkpoint, path, storage_options)
+
+    logger.debug("Saving checkpoint to local storage.")
+    self._save_to_persistent_storage = False
+    use_in_cluster_local_ckpts = True
 
     fs = get_filesystem(path)
-    if get_is_checkpoint_file_handler(
-      use_in_cluster_local_ckpts,
-      is_persistent_storage
-    ):
+    if get_is_checkpoint_file_handler(use_in_cluster_local_ckpts):
       fs.makedirs(path, exist_ok=True)
     dist.barrier()
 
@@ -185,7 +217,6 @@ class InClusterLocalCheckpointIO(DistributedCheckpointIO):
         validate_access_integrity=validate_sharding_integrity,
         async_sharded_save=self.async_save,
         use_in_cluster_local_ckpts=use_in_cluster_local_ckpts,
-        is_persistent_storage=is_persistent_storage,
     )
 
   @debug_time("InClusterLocalCheckpointIO.load_checkpoint")
@@ -214,6 +245,18 @@ class InClusterLocalCheckpointIO(DistributedCheckpointIO):
         Returns:
             Dist[str, Any]: loaded checkpoint.
     """
+    # Defer to super().load_checkpoint when loading from persistent storage
+    if self.local_ckpt_dir is None or str(self.local_ckpt_dir) not in str(path):
+      logger.debug("Loading checkpoint from persistent storage.")
+      return super().load_checkpoint(
+          path=path,
+          map_location=map_location,
+          sharded_state_dict=sharded_state_dict,
+          strict=strict,
+          validate_access_integrity=validate_access_integrity,
+      )
+    logger.debug("Loading checkpoint from local storage.")
+
     if self.use_ckpt_load_replication:
       self.replication_coordinator = get_replication_coordinator(path)
 
@@ -236,7 +279,7 @@ class InClusterLocalCheckpointIO(DistributedCheckpointIO):
           self.replication_coordinator
       )
 
-    if self.parallel_load:
+    if self.local_parallel_load:
       if sharded_strategy is None:
         sharded_strategy = get_default_load_sharded_strategy(path)
       sharded_strategy = FullyParallelLoadStrategyWrapper(
@@ -276,7 +319,23 @@ class InClusterLocalCheckpointIO(DistributedCheckpointIO):
         replication_coordinator=self.replication_coordinator,
     )
 
-  def _determine_dist_ckpt_save_strategy(self):
+  @property
+  def save_sharded_strategy(self) -> "SaveShardedStrategy":
+    """Conditionally initialize and get the sharded strategy to use for saving."""
+    if self._save_to_persistent_storage:
+      if self._persistent_save_sharded_strategy is None:
+        self._persistent_save_sharded_strategy = (
+            self._determine_dist_ckpt_save_strategy()
+        )
+      return self._persistent_save_sharded_strategy
+    else:
+      if self._local_save_sharded_strategy is None:
+        self._local_save_sharded_strategy = (
+            self._determine_dist_ckpt_save_strategy()
+        )
+      return self._local_save_sharded_strategy
+
+  def _determine_dist_ckpt_save_strategy(self) -> "SaveShardedStrategy":
     """Determine the saving strategy based on constructor args.
 
     Relies on the default MCore strategy unless extra PyT Distributed format
@@ -302,9 +361,14 @@ class InClusterLocalCheckpointIO(DistributedCheckpointIO):
         else dict(thread_count=self.torch_dist_multiproc)
     )
     if self.save_ckpt_format == "torch_dist" and torch_dist_kwargs:
-      save_strategy = InClusterLocalCheckpointSaveStrategy(
-          self.save_ckpt_format, 1, **torch_dist_kwargs
-      )
+      if self._save_to_persistent_storage:
+        save_strategy = TorchDistSaveShardedStrategy(
+            self.save_ckpt_format, 1, **torch_dist_kwargs
+        )
+      else:
+        save_strategy = InClusterLocalCheckpointSaveStrategy(
+            self.save_ckpt_format, 1, **torch_dist_kwargs
+        )
     else:
       save_strategy = get_default_save_sharded_strategy(
           self.save_ckpt_format, 1
@@ -314,10 +378,20 @@ class InClusterLocalCheckpointIO(DistributedCheckpointIO):
     if hasattr(save_strategy, "use_cached_ckpt_structure"):
       save_strategy.use_cached_ckpt_structure = self.assume_constant_structure
 
-    if self.parallel_save:
+    if self._save_to_persistent_storage and self.persistent_parallel_save:
       parallelization_group = (
           get_data_parallel_group(with_context_parallel=True)
-          if self.parallel_save_within_dp
+          if self.persistent_parallel_save_within_dp
+          else None
+      )
+      save_strategy = FullyParallelSaveStrategyWrapper(
+          save_strategy, parallelization_group, self.assume_constant_structure
+      )
+
+    if not self._save_to_persistent_storage and self.local_parallel_save:
+      parallelization_group = (
+          get_data_parallel_group(with_context_parallel=True)
+          if self.local_parallel_save_within_dp
           else None
       )
       save_strategy = FullyParallelSaveStrategyWrapper(
@@ -353,10 +427,10 @@ class InClusterLocalCheckpointSaveStrategy(TorchDistSaveShardedStrategy):
     self.keep_only_main_replica = False
 
   def save_common(self, common_state_dict: StateDict, checkpoint_dir: Path):
-    if get_is_checkpoint_file_handler(
-      is_cluster_local_checkpointing=True,
-      is_persistent_storage=False
-    ):
+    if get_is_checkpoint_file_handler(is_cluster_local_checkpointing=True):
+      # Add world size to common state dict
+      common_state_dict["world_size"] = torch.distributed.get_world_size()
+
       torch.save(common_state_dict, checkpoint_dir / COMMON_STATE_FNAME)
 
   def async_save(
@@ -416,15 +490,13 @@ class InClusterLocalCheckpointSaveStrategy(TorchDistSaveShardedStrategy):
     rank = torch.distributed.get_rank()
     if self.use_cached_ckpt_structure:
       if self.validated_cache_reuse:
-        logger.debug(f"rank: {rank}, cache validated")
+        logger.debug(f"Cache validated")
         if save_state_dict_ret[1]:  # when global_metadata is not cached
           self.cached_global_metadata = save_state_dict_ret[1]  # Cache Metadata
         # Only Coordinator rank holds cached global_metadata
         # (None is returned for global_metadata)
         elif coordinator == rank:
-          logger.debug(
-              f"rank: {rank}, reuse metadata, {save_state_dict_ret[1]}"
-          )
+          logger.debug(f"Reuse metadata, {save_state_dict_ret[1]}")
           save_state_dict_ret = list(save_state_dict_ret)
           save_state_dict_ret[1] = self.cached_global_metadata
 
@@ -651,6 +723,16 @@ def in_cluster_load(
         common_strategy, broadcast=True
     )
 
+  # Check world_size in common state dict
+  if (
+      common_state_dict.get("world_size", -1)
+      != torch.distributed.get_world_size()
+  ):
+    raise ValueError(
+        "Common state dict does not contain the correct world size. This"
+        " checkpoint cannot be loaded."
+    )
+
   sharded_state_dict, nonpersistent_state_dict, sh_ten_factories = (
       load_preprocess(sharded_state_dict)
   )
@@ -870,7 +952,7 @@ def save_state_dict_async_plan(
   assert planner is not None
 
   global_metadata = None
-  logger.debug(f"rank: {rank}, starting state dict save")
+  logger.debug(f"starting state dict save")
   local_plan = cached_local_plan
 
   def local_step():
@@ -904,7 +986,7 @@ def save_state_dict_async_plan(
   # Execute local and global planning
   start_plan = time()
   if validated_cache_reuse and cached_central_plan:
-    logger.debug(f"rank: {rank}, Passed cache reusable")
+    logger.debug(f"Passed cache reusable")
     local_step()
     central_plan = cached_central_plan
   else:
@@ -919,13 +1001,13 @@ def save_state_dict_async_plan(
       torch.distributed.barrier()
   central_plan = planner.finish_plan(central_plan)
   end_plan = time()
-  logger.debug(f"rank: {rank}, plan time: {end_plan - start_plan}")
+  logger.debug(f"plan time: {end_plan - start_plan}")
   # Prepare async writing of tensors.
   # The `storage_writer` will store the information about tensors it needs to save
   start = time()
   storage_writer.prepare_write_data(central_plan, planner)
   end = time()
-  logger.debug(f"{time()} rank: {rank}, write(async) time: {end - start}")
+  logger.debug(f"write(async) time: {end - start}")
   return (
       (storage_writer, cast(Metadata, global_metadata), dist_wrapper),
       central_plan,

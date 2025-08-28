@@ -1,0 +1,96 @@
+--- local_elastic_agent_original.py	2025-08-28 21:37:29.004975109 +0000
++++ local_elastic_agent.py	2025-08-28 20:46:17.599953979 +0000
+@@ -15,7 +15,7 @@
+ import time
+ import uuid
+ from string import Template
+-from typing import Any, Optional, TYPE_CHECKING
++from typing import Any, Optional, TYPE_CHECKING, Dict
+ 
+ import torch.distributed.elastic.timer as timer
+ from torch.distributed.elastic import events
+@@ -162,6 +162,47 @@
+         self._worker_watchdog: Optional[timer.FileTimerServer] = None
+         self._logs_specs = logs_specs
+         self._health_check_server: Optional[HealthCheckServer] = None
++        self._rank_to_gclient: Dict[int, Any] = dict()
++
++    def _setup_goodput_client(self, envs: Dict[int, Dict[str, str]]) -> None:
++
++        for worker_env in envs.values():
++            if worker_env.get('GCP_HOST_DAEMON_PORT') is None:
++                logger.info(f"Not set up goodput client as GCP_HOST_DAEMON_PORT is not set.")
++                return
++            try:
++                rank = int(worker_env["RANK"])
++                local_rank = int(worker_env["LOCAL_RANK"])
++                host_port = int(worker_env["GCP_HOST_DAEMON_PORT"])
++                worker_port = host_port + local_rank + 1
++                import supervisor
++
++                self._rank_to_gclient[rank] = supervisor.GoogleCloudResiliencyClient(
++                    worker_port,
++                    host_port,
++                    local_rank,
++                    rank)
++                logger.info(f"setup_goodput_client at {rank=} success")
++            except ImportError as e:
++                logger.info(f"setup_goodput_client at {rank=} fail")
++                self._rank_to_gclient[rank] = None
++
++    def _update_gclient_state(self, global_rank, worker_state):
++        """
++        Uses pytorch WorkerState to update gclient state.
++        """
++        if self._rank_to_gclient is None or self._rank_to_gclient.get(global_rank) is None:
++            return
++        from supervisor import DeviceState
++        worker_state_to_device_state = {
++            WorkerState.FAILED: DeviceState.FAILED,
++            WorkerState.HEALTHY: DeviceState.RUNNING,
++            WorkerState.SUCCEEDED: DeviceState.COMPLETE,
++        }
++        assert worker_state in worker_state_to_device_state
++        self._rank_to_gclient[global_rank].update_state(worker_state_to_device_state[worker_state])
++
++
+ 
+     def _setup_local_watchdog(self, envs: dict[int, dict[str, str]]) -> None:
+         enable_watchdog_env_name = TORCHELASTIC_ENABLE_FILE_TIMER
+@@ -342,6 +383,7 @@
+ 
+         self._setup_local_watchdog(envs=envs)
+         self._setup_healthcheck()
++        self._setup_goodput_client(envs=envs)
+ 
+         assert spec.entrypoint is not None
+         assert self._logs_specs is not None
+@@ -353,7 +395,6 @@
+             logs_specs=self._logs_specs,
+             log_line_prefixes=log_line_prefixes,
+             start_method=self._start_method,
+-            numa_options=spec.numa_options,
+         )
+ 
+         return self._pcontext.pids()
+@@ -394,6 +435,7 @@
+                 for local_rank, failure in result.failures.items():
+                     worker = worker_group.workers[local_rank]
+                     worker_failures[worker.global_rank] = failure
++                    self._update_gclient_state(worker.global_rank, WorkerState.FAILED)
+                 return RunResult(
+                     state=WorkerState.FAILED,
+                     failures=worker_failures,
+@@ -404,9 +446,12 @@
+                 for local_rank, ret_val in result.return_values.items():
+                     worker = worker_group.workers[local_rank]
+                     workers_ret_vals[worker.global_rank] = ret_val
++                    self._update_gclient_state(worker.global_rank, WorkerState.SUCCEEDED)
+                 return RunResult(
+                     state=WorkerState.SUCCEEDED,
+                     return_values=workers_ret_vals,
+                 )
+         else:
++            for global_rank in self._rank_to_gclient.keys():
++                self._update_gclient_state(global_rank, WorkerState.HEALTHY)
+             return RunResult(state=WorkerState.HEALTHY)

@@ -16,6 +16,7 @@ limitations under the License.
 import logging
 import os
 import sys
+
 import torch
 import torch.distributed as dist
 
@@ -29,6 +30,10 @@ class SingleLetterFormatter(logging.Formatter):
 
 
 class ResiliencyLoggingFormatter(logging.Formatter):
+
+  def __init__(self, logger: logging.Logger, name: str = ""):
+    self.logger = logger
+    super().__init__(name)
 
   def format(self, record: logging.LogRecord) -> str:
     """Formats the log record with a custom format.
@@ -44,17 +49,30 @@ class ResiliencyLoggingFormatter(logging.Formatter):
     lineno = record.lineno
 
     timestamp = self.formatTime(record, "%Y-%m-%d %H:%M:%S")
-    prefix = f"[Resiliency {level_abbr} {timestamp} {module}:{lineno}]"
+    prefix = f"[Resiliency {level_abbr} {timestamp} {module}:{lineno} rank:"
+    if self.logger.isEnabledFor(logging.DEBUG):
+      rank = (
+          dist.get_rank()
+          if dist.is_initialized()
+          else int(os.getenv("RANK", 0))
+      )
+      prefix += f"{rank}]"
+    else:
+      prefix += "0]"
     message = super().format(record)
     return f"{prefix} {message}"
 
 
 class ResiliencyLoggingFilter(logging.Filter):
 
-  def filter(self, record: logging.LogRecord) -> bool:
-    """Filter messages based on rank. All logs print on rank 0.
+  def __init__(self, logger: logging.Logger):
+    self.logger = logger
+    super().__init__()
 
-    Debug logs print on all ranks.
+  def filter(self, record: logging.LogRecord) -> bool:
+    """Filter messages based on rank.
+
+    Logs are only printed on rank 0 when not in DEBUG mode.
 
     Args:
         record (logging.LogRecord): Log record to filter.
@@ -62,11 +80,12 @@ class ResiliencyLoggingFilter(logging.Filter):
     Returns:
         bool: True if the log should be printed, False otherwise.
     """
+    if self.logger.isEnabledFor(logging.DEBUG):
+      return True
+
     rank = (
         dist.get_rank() if dist.is_initialized() else int(os.getenv("RANK", 0))
     )
-    if record.levelno <= logging.DEBUG:
-      return True
     return rank == 0
 
 
@@ -88,9 +107,9 @@ def get_resiliency_logger(
     logger.setLevel(level)
   if not logger.handlers:
     handler = logging.StreamHandler(sys.stdout)
-    formatter = ResiliencyLoggingFormatter("%(message)s")
+    formatter = ResiliencyLoggingFormatter(logger, "%(message)s")
     handler.setFormatter(formatter)
-    handler.addFilter(ResiliencyLoggingFilter())
+    handler.addFilter(ResiliencyLoggingFilter(logger))
     logger.addHandler(handler)
 
   logger.propagate = False
@@ -107,16 +126,13 @@ def test_all_reduce(rank, local_rank, world_size):
     tensor = torch.tensor(
         [float(rank)], dtype=torch.float32, device=f"cuda:{local_rank}"
     )
-    logger.debug(f"[Rank {rank}] Before all_reduce: {tensor.item()}")
+    logger.debug(f"Before all_reduce: {tensor.item()}")
     # Expected sum is sum of all ranks: 0 + 1 + ... + (world_size-1)
     expected = float(world_size * (world_size - 1) / 2)
     dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-    logger.debug(
-        f"[Rank {rank}] After all_reduce sum: {tensor.item()} expected:"
-        f" {expected}"
-    )
+    logger.debug(f"After all_reduce sum: {tensor.item()} expected: {expected}")
     assert abs(tensor.item() - expected) < 1e-5
     return True
   except Exception as e:
-    logger.debug(f"[Rank {rank}] All_reduce test failed: {str(e)}")
+    logger.debug(f"All_reduce test failed: {str(e)}")
     return False

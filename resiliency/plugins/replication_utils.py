@@ -27,8 +27,8 @@ from lightning.fabric.utilities.rank_zero import rank_zero_info
 from lightning.fabric.utilities.seed import reset_seed
 from lightning.pytorch.strategies.ddp import DDPStrategy
 from megatron.core import parallel_state
-from megatron.core.dist_checkpointing.strategies.torch import MCoreLoadPlanner
 from megatron.core.dist_checkpointing.core import CheckpointingException
+from megatron.core.dist_checkpointing.strategies.torch import MCoreLoadPlanner
 from nemo import lightning as nl
 from nemo.lightning.pytorch.strategies.utils import init_model_parallel, setup_parallel_ranks
 from resiliency.utils import get_resiliency_logger
@@ -585,9 +585,10 @@ def get_local_ckpt_rank(checkpoint_dir: Path) -> int:
             )
           local_ckpt_rank = rank
 
-    assert (
-        local_ckpt_rank != -1
-    ), f"Unable to determine rank of local checkpoint."
+    if local_ckpt_rank == -1:
+      raise CheckpointingException(
+          "Unable to determine rank of local checkpoint."
+      )
 
   return local_ckpt_rank
 
@@ -657,7 +658,8 @@ def get_replication_coordinator(
         6], [3, 7].
 
   Raises:
-      CheckpointException: An error is raised if at least one rank needs state, but no
+      CheckpointException: An error is raised if at least one rank needs state,
+      but no
       other rank in its data parallel group has state.
 
   Returns:

@@ -29,6 +29,7 @@ from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.optimizer import OptimizerConfig
 import nemo
 from nemo import lightning as nl
+from nemo.collections.common.tokenizers import SentencePieceTokenizer
 from nemo.collections.llm.gpt.data.mock import MockDataModule
 from nemo.lightning.pytorch.optim.megatron import MegatronOptimizerModule
 from nemo.utils.callbacks.dist_ckpt_io import AsyncFinalizableCheckpointIO
@@ -73,7 +74,6 @@ class TwoNodeMockCheckpointConnector(CheckpointConnector):
   """A custom checkpoint connector for two-node mock setup."""
 
   def _restore_modules_and_callbacks(self, checkpoint_path=None) -> None:
-    print(f"rank {dist.get_rank()} checkpoint_path:", checkpoint_path)
     checkpoint_dir = None
 
     if checkpoint_path is not None:
@@ -139,12 +139,11 @@ class TwoNodeMockCheckpointConnector(CheckpointConnector):
             f"Found invalid checkpoint {checkpoint_path} on trial {trial+1}:"
             f" {str(e)}"
         )
-        is_persistent_storage = str(checkpoint_path).startswith(
-            str(self.persistent_ckpt_dir)
+        is_cluster_local_checkpointing = str(checkpoint_path).startswith(
+            str(self.local_ckpt_dir)
         )
         if get_is_checkpoint_file_handler(
-            is_cluster_local_checkpointing=self.local_ckpt_dir is not None,
-            is_persistent_storage=is_persistent_storage,
+            is_cluster_local_checkpointing=is_cluster_local_checkpointing,
         ):
           marker_path = (
               ModelCheckpoint.format_checkpoint_unfinished_marker_path(
@@ -163,14 +162,13 @@ class TwoNodeMockCheckpointConnector(CheckpointConnector):
               f" from {checkpoint_dir}"
           )
     if self.persistent_ckpt_dir and get_is_checkpoint_file_handler(
-        is_cluster_local_checkpointing=self.local_ckpt_dir is not None,
-        is_persistent_storage=True,
+        is_cluster_local_checkpointing=is_cluster_local_checkpointing
     ):
       ModelCheckpoint._remove_unfinished_checkpoints(
           self.persistent_ckpt_dir, True
       )
     if self.local_ckpt_dir and get_is_checkpoint_file_handler(
-        is_cluster_local_checkpointing=True, is_persistent_storage=False
+        is_cluster_local_checkpointing=is_cluster_local_checkpointing
     ):
       ModelCheckpoint._remove_unfinished_checkpoints(self.local_ckpt_dir, True)
 
@@ -260,9 +258,12 @@ def save_load_checkpoint(rank, world_size, base_temp_dir, test_case):
         async_save=True,
         torch_dist_multiproc=2,  # Use 2 threads per rank
         assume_constant_structure=True,
-        parallel_save=False,
-        parallel_save_within_dp=False,
-        parallel_load=False,
+        persistent_parallel_save=True,
+        persistent_parallel_save_within_dp=True,
+        persistent_parallel_load=True,
+        local_parallel_save=False,
+        local_parallel_save_within_dp=False,
+        local_parallel_load=False,
         use_ckpt_load_replication=True,
     )
 
@@ -294,6 +295,7 @@ def save_load_checkpoint(rank, world_size, base_temp_dir, test_case):
         num_train_samples=100,
         pin_memory=False,
         micro_batch_size=1,
+        tokenizer=SentencePieceTokenizer(model_path="tokenizer.model"),
     )
 
     # Define megatron strategy

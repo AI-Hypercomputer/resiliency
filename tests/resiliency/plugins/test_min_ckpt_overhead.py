@@ -20,22 +20,22 @@ from pathlib import Path
 import shutil
 import tempfile
 from typing import Optional
-import pytest
-
 from megatron.core.dist_checkpointing.dict_utils import diff
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.optimizer import OptimizerConfig
 import nemo
 from nemo import lightning as nl
 from nemo.collections.llm.gpt.data.mock import MockDataModule
+from nemo.collections.common.tokenizers import SentencePieceTokenizer
 from nemo.lightning.pytorch.optim.megatron import MegatronOptimizerModule
+import pytest
 from resiliency.callbacks import model_checkpoint
+from resiliency.connectors.checkpoint_connector import CheckpointConnector
 from resiliency.model import Llama3Config36M
 from resiliency.plugins._ckpt_utils import find_latest_checkpoint_path
 from resiliency.plugins.min_ckpt_overhead import MinCkptOverheadCheckpointIO
 from resiliency.plugins.persistent_ckpt_proc import PersistentCheckpointProcessIO
 import torch
-
 
 
 @pytest.mark.skipif(
@@ -96,6 +96,7 @@ def test_save_load_checkpoint():
         num_train_samples=100,
         pin_memory=False,
         micro_batch_size=1,
+        tokenizer=SentencePieceTokenizer(model_path="tokenizer.model"),
     )
 
     # Define megatron strategy
@@ -144,6 +145,11 @@ def test_save_load_checkpoint():
         val_check_interval=None,
         limit_val_batches=None,
         callbacks=callbacks,
+    )
+
+    trainer._checkpoint_connector = CheckpointConnector(
+        trainer=trainer,
+        persistent_ckpt_dir=ckpt_path,
     )
 
     # Train for 2 steps to generate 2 checkpoints

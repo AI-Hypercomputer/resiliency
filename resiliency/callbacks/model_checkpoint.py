@@ -100,6 +100,7 @@ class ModelCheckpoint(PTLModelCheckpoint):
       use_in_cluster_local_ckpts: bool = False,
       is_persistent_storage: bool = False,
       enable_high_scale_ckpt: bool = False,
+      delete_unfinished_ckpt_on_start: bool = True,
       priority: int = 0,
       **kwargs,
   ):
@@ -147,6 +148,7 @@ class ModelCheckpoint(PTLModelCheckpoint):
     self.is_persistent_storage = is_persistent_storage
     self.enable_high_scale_ckpt = enable_high_scale_ckpt
     self.preprocess_files = preprocess_files
+    self.delete_unfinished_ckpt_on_start = delete_unfinished_ckpt_on_start
 
   def on_train_start(self, trainer, pl_module):
     from nemo.utils.exp_manager import get_git_diff, get_git_hash
@@ -316,14 +318,15 @@ class ModelCheckpoint(PTLModelCheckpoint):
     self._remove_invalid_entries_from_topk()
 
   def setup(self, trainer, *args, **kwargs) -> None:
-    if self.is_checkpoint_file_handler:
-      logging.info("Removing unfinished checkpoints if any...")
-      ModelCheckpoint._remove_unfinished_checkpoints(
-          self.dirpath, self.is_checkpoint_file_handler
-      )
-    # Ensure that all ranks continue with unfinished checkpoints removed
-    if torch.distributed.is_initialized():
-      torch.distributed.barrier()
+    if self.delete_unfinished_ckpt_on_start:
+      if self.is_checkpoint_file_handler:
+        logging.info("Removing unfinished checkpoints if any...")
+        ModelCheckpoint._remove_unfinished_checkpoints(
+            self.dirpath, self.is_checkpoint_file_handler
+        )
+      # Ensure that all ranks continue with unfinished checkpoints removed
+      if torch.distributed.is_initialized():
+        torch.distributed.barrier()
 
     self.async_save = getattr(trainer.strategy, "async_save", False)
     super().setup(trainer, *args, **kwargs)
@@ -706,6 +709,7 @@ class ModelCheckpoint(PTLModelCheckpoint):
 
       if self.enable_high_scale_ckpt and self.is_checkpoint_file_handler:
         from resiliency import high_scale_ckpt_utils
+
         ckpt_path = Path(filepath)
         high_scale_ckpt_utils.handle_replicator_fail_situation(ckpt_path.parent)
         high_scale_ckpt_path = ckpt_path.parent / f"{global_step-1}"
@@ -807,7 +811,8 @@ class ModelCheckpoint(PTLModelCheckpoint):
 
     if not is_checkpoint_file_handler:
       raise AssertionError(
-          "_remove_unfinished_checkpoints should run only on rank 0"
+          "_remove_unfinished_checkpoints should run only on checkpoint file"
+          " handler ranks."
       )
 
     checkpoint_dir = Path(checkpoint_dir)
@@ -908,12 +913,20 @@ class ModelCheckpoint(PTLModelCheckpoint):
             )
             return True
 
-          # skip saving to local disk if there exists saving request in queue.
-          if trainer.strategy.checkpoint_io.async_calls_queue.get_num_unfinalized_calls() > 0:
-            logging.info(f'Skipping saving local ckpt at step={trainer.global_step} since there is existing saving request in queue.')
+          # Skip saving this checkpoint if there is an ongoing checkpoint save request.
+          skip_batch = self._every_n_train_steps < 1 or (
+              trainer.global_step % self._every_n_train_steps != 0
+          )
+          if (
+              not skip_batch
+              and trainer.strategy.checkpoint_io.async_calls_queue.get_num_unfinalized_calls()
+              > 0
+          ):
+            logging.info(
+                "Skipping saving local ckpt at"
+                f" step={trainer.global_step} since there is existing saving"
+                " request in queue."
+            )
             return True
 
     return super()._should_skip_saving_checkpoint(trainer)
-
-
-

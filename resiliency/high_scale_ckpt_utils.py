@@ -87,7 +87,8 @@ def handle_replicator_fail_situation(directory):
     failed_message = failed_file_path.read_text()
     logger.fatal(f"Repliactor failed: {failed_message}")
     failed_file_path.unlink()
-    raise ValueError(f'Replictor failed with error {failed_message}')
+    raise ValueError(f"Replictor failed with error {failed_message}")
+
 
 def process_replicator_prerestore(directory, timeout_s=300):
   """Return step number to be loaded."""
@@ -106,10 +107,12 @@ def process_replicator_prerestore(directory, timeout_s=300):
         logger.error(f"Error loading YAML file: {e}")
         return 0
       step = int(prerestore_info.get("restore-step", 0))
-      logger.info(f'Replicator found {step=} ckpt available after {ts} s, to be loaded')
+      logger.info(
+          f"Replicator found {step=} ckpt available after {ts} s, to be loaded"
+      )
       return step
   logger.info(f"Replicator prerestore file not found after {timeout_s} s.")
-  raise ValueError(f'Replictor failed to produce prerestore file.')
+  raise ValueError(f"Replictor failed to produce prerestore file.")
 
 
 def block_and_proces_restore_dir(directory, timeout_s=300):

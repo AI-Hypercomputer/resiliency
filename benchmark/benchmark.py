@@ -76,8 +76,6 @@ from resiliency.plugins.replication_utils import ReplicatedOptimizerMegatronStra
 resiliency_logger = get_resiliency_logger(__name__)
 
 
-
-
 def get_trainer(args, callbacks, world_size, parallel_config, trace_dir):
   if args.num_optimizer_replicas > 1:
     # Supports replicated distributed optimizer
@@ -118,12 +116,16 @@ def get_trainer(args, callbacks, world_size, parallel_config, trace_dir):
         async_save=args.enable_async_ckpt or args.enable_optimized_async_ckpt,
         torch_dist_multiproc=args.ckpt_threads_per_rank,
         assume_constant_structure=True,
-        parallel_save=False,
-        parallel_save_within_dp=False,
-        parallel_load=False,
+        persistent_parallel_save=True,
+        persistent_parallel_save_within_dp=False,
+        persistent_parallel_load=True,
+        local_parallel_save=False,
+        local_parallel_save_within_dp=False,
+        local_parallel_load=False,
         use_ckpt_load_replication=True
         if args.enable_ckpt_load_replication
         else False,
+        local_ckpt_dir=args.local_ckpt_dir,
     )
 
   elif args.enable_optimized_async_ckpt:
@@ -145,12 +147,16 @@ def get_trainer(args, callbacks, world_size, parallel_config, trace_dir):
         async_save=args.enable_async_ckpt or args.enable_optimized_async_ckpt,
         torch_dist_multiproc=args.ckpt_threads_per_rank,
         assume_constant_structure=True,
-        parallel_save=False,
-        parallel_save_within_dp=False,
-        parallel_load=False,
+        persistent_parallel_save=True,
+        persistent_parallel_save_within_dp=False,
+        persistent_parallel_load=True,
+        local_parallel_save=False,
+        local_parallel_save_within_dp=False,
+        local_parallel_load=False,
         use_ckpt_load_replication=True
         if args.enable_ckpt_load_replication
         else False,
+        local_ckpt_dir=args.local_ckpt_dir,
     )
 
   else:
@@ -274,12 +280,6 @@ def get_parser():
       type=int,
       default=10,
       help="How many batches to use for validation.",
-  )
-  parser.add_argument(
-      "--global-bs",
-      type=int,
-      default=None,
-      help="Global batch size.",
   )
   parser.add_argument(
       "--log-dir",
@@ -517,13 +517,14 @@ def main():
     )
 
   if args.enable_high_scale_ckpt:
-    assert args.local_ckpt_dir == high_scale_ckpt_utils.CHECKPOINT_FOLDER_PATH,\
-      f"high scale ckpt requires ckpt folder to be {high_scale_ckpt_utils.CHECKPOINT_FOLDER_PATH}"
+    assert (
+        args.local_ckpt_dir == high_scale_ckpt_utils.CHECKPOINT_FOLDER_PATH
+    ), (
+        "high scale ckpt requires ckpt folder to be"
+        f" {high_scale_ckpt_utils.CHECKPOINT_FOLDER_PATH}"
+    )
 
-    if get_is_checkpoint_file_handler(
-      is_cluster_local_checkpointing=True,
-      is_persistent_storage=False
-    ):
+    if get_is_checkpoint_file_handler(is_cluster_local_checkpointing=True):
       assert (
           args.local_ckpt_dir and args.local_ckpt_interval > 0
       ), f"in cluster local ckpt config {args.local_ckpt_dir=} "
@@ -552,11 +553,6 @@ def main():
 
   mbs = 1
   gbs = mbs * args.num_gpus * args.num_nodes
-  if args.global_bs is not None:
-    gbs = (args.global_bs // (mbs * args.num_gpus * args.num_nodes)) * (
-        mbs * args.num_gpus * args.num_nodes
-    )
-    assert gbs > 0
 
   if args.num_optimizer_replicas > 1:
     if args.model in ["36M", "70B", "405B"]:

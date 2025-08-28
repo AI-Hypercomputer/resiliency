@@ -100,10 +100,7 @@ class CheckpointConnector(_CheckpointConnector):
 
     if self.enable_high_scale_ckpt:
       checkpoint_dir = high_scale_ckpt_utils.CHECKPOINT_FOLDER_PATH
-      if get_is_checkpoint_file_handler(
-        is_cluster_local_checkpointing=True,
-        is_persistent_storage=False
-      ):
+      if get_is_checkpoint_file_handler(is_cluster_local_checkpointing=True):
         high_scale_ckpt_utils.block_and_proces_restore_dir(
             checkpoint_dir, timeout_s=300
         )
@@ -124,19 +121,31 @@ class CheckpointConnector(_CheckpointConnector):
             synchronize=self.use_ckpt_load_replication,
         )
       else:
-        # Use enhanced find_latest_checkpoint_path with list of directories
-        checkpoint_dirs_to_search = [
-            self.persistent_ckpt_dir,
-            self.local_ckpt_dir
-        ]
+        # Last trial will only search persistent storage
+        if trial + 1 == MAX_TRIALS:
+          logger.info("Last try, searching only persistent storage")
+          checkpoint_dirs_to_search = self.persistent_ckpt_dir
+        else:
+          checkpoint_dirs_to_search = [
+              self.persistent_ckpt_dir,
+              self.local_ckpt_dir,
+          ]
+
+        # Find latest checkpoint path in the specified directories
         checkpoint_path = find_latest_checkpoint_path(
             checkpoint_dir=checkpoint_dirs_to_search,
             synchronize=self.use_ckpt_load_replication,
         )
 
+      is_cluster_local_checkpointing = str(checkpoint_path).startswith(
+          str(self.local_ckpt_dir)
+      )
+
       assert torch.distributed.is_initialized()
       torch.distributed.barrier()
       if checkpoint_path is None:
+        logger.info("No valid checkpoint found, start from scratch..")
+        start_from_scratch = True
         break
       start_from_scratch = False
       logger.info(
@@ -145,6 +154,7 @@ class CheckpointConnector(_CheckpointConnector):
       )
 
       try:
+
         super()._restore_modules_and_callbacks(checkpoint_path)
         if checkpoint_path is not None:
           loaded_successfully = True
@@ -159,10 +169,8 @@ class CheckpointConnector(_CheckpointConnector):
             f"Found invalid checkpoint {checkpoint_path} on trial {trial+1}:"
             f" {str(e)}"
         )
-        is_persistent_storage = str(checkpoint_path).startswith(str(self.persistent_ckpt_dir))
         if get_is_checkpoint_file_handler(
-          is_cluster_local_checkpointing=self.local_ckpt_dir is not None,
-          is_persistent_storage=is_persistent_storage
+            is_cluster_local_checkpointing=is_cluster_local_checkpointing,
         ):
           marker_path = model_checkpoint.ModelCheckpoint.format_checkpoint_unfinished_marker_path(
               checkpoint_path
@@ -179,25 +187,23 @@ class CheckpointConnector(_CheckpointConnector):
               f" from {checkpoint_dir}"
           )
     if self.persistent_ckpt_dir and get_is_checkpoint_file_handler(
-          is_cluster_local_checkpointing=self.local_ckpt_dir is not None,
-          is_persistent_storage=True
-        ):
+        is_cluster_local_checkpointing=is_cluster_local_checkpointing,
+    ):
       model_checkpoint.ModelCheckpoint._remove_unfinished_checkpoints(
           self.persistent_ckpt_dir, True
       )
     if self.local_ckpt_dir and get_is_checkpoint_file_handler(
-          is_cluster_local_checkpointing=True,
-          is_persistent_storage=False
-        ):
+        is_cluster_local_checkpointing=is_cluster_local_checkpointing,
+    ):
       model_checkpoint.ModelCheckpoint._remove_unfinished_checkpoints(
-          self.local_ckpt_dir, True)
+          self.local_ckpt_dir, True
+      )
 
     if self.terminate_if_load_fail and not (
         loaded_successfully or start_from_scratch
     ):
       raise CheckpointingException(
-          "Failed to load any valid checkpoint after"
-          f" {MAX_TRIALS} attempts"
+          f"Failed to load any valid checkpoint after {MAX_TRIALS} attempts"
       )
 
     if start_from_scratch:

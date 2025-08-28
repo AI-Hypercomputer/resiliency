@@ -13,7 +13,8 @@
 # - security fix for watchdog_file_path
 
 # Modifications made by Google
-# - add resiliency client
+# - add Google Cloud resiliency client
+# - add Google Cloud resiliency client arguments
 
 # fmt: off
 import contextlib
@@ -29,7 +30,7 @@ import uuid
 from argparse import REMAINDER, ArgumentParser
 from dataclasses import dataclass, field
 from string import Template
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Type, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Type, Union, cast
 
 import torch
 from torch.distributed.argparse_util import check_env, env
@@ -111,6 +112,84 @@ class RankCachingRdzvHandlerWrapper:
 
   def __getattr__(self, attr):
     return getattr(self._rdzv_handler, attr)
+
+
+@dataclass
+class SupervisorConfig:
+  """Configuration for the Google Cloud Resiliency Supervisor component.
+
+  Args:
+    host_daemon_port: The port to communicate with the host daemon on a node.
+    max_in_job_restarts: The maximum number of restarts allowed within a job.
+    max_workload_restarts: The maximum number of restarts allowed for a
+      workload.
+    enable_workload_scaling: Whether to enable workload scaling.
+    num_nodes_per_dp: The number of nodes per data plane replica.
+    num_dp_replicas: The number of data plane replicas.
+    min_num_dp_replicas: The minimum number of data plane replicas.
+    max_num_dp_replicas: The maximum number of data plane replicas.
+    workload_downtime_threshold_s: The threshold in seconds for workload
+      downtime.
+    container_termination_threshold_s: The threshold in seconds for container
+      termination.
+    workload_name: The name of the workload.
+    job_name: The name of the job.
+    container_name: The name of the container.
+
+  Raises:
+    ValueError: If any of the arguments are invalid.
+  """
+
+  host_daemon_port: int
+  max_in_job_restarts: int
+  max_workload_restarts: int
+  enable_workload_scaling: bool
+  num_nodes_per_dp: int
+  num_dp_replicas: int
+  min_num_dp_replicas: int
+  max_num_dp_replicas: int
+  workload_downtime_threshold_s: int
+  container_termination_threshold_s: int
+  workload_name: Optional[str] = None
+  job_name: Optional[str] = None
+  container_name: Optional[str] = None
+
+  def __post_init__(self):
+    if self.max_in_job_restarts < 0 or self.max_workload_restarts < 0:
+      raise ValueError(
+          "max_in_job_restarts and max_workload_restarts must be non-negative"
+      )
+    if (
+        self.container_termination_threshold_s < 0
+        or self.workload_downtime_threshold_s < 0
+    ):
+      raise ValueError(
+          "workload_downtime_threshold_s and container_termination_threshold_s"
+          " must be non-negative"
+      )
+    if not self.workload_name or not self.job_name or not self.container_name:
+      raise ValueError(
+          "workload_name, job_name, and container_name must be set"
+      )
+    if self.enable_workload_scaling:
+      if self.num_nodes_per_dp is None or self.num_dp_replicas is None:
+        raise ValueError(
+            "num_nodes_per_dp and num_dp_replicas must be set when"
+            " enable_workload_scaling is True"
+        )
+      if self.min_num_dp_replicas is None:
+        self.min_num_dp_replicas = self.num_dp_replicas
+      if self.max_num_dp_replicas is None:
+        self.max_num_dp_replicas = self.num_dp_replicas
+      if self.min_num_dp_replicas < 0 or self.max_num_dp_replicas < 0:
+        raise ValueError(
+            "min_num_dp_replicas and max_num_dp_replicas must be non-negative"
+        )
+      if self.min_num_dp_replicas > self.max_num_dp_replicas:
+        raise ValueError(
+            "min_num_dp_replicas must be less than or equal to"
+            " max_num_dp_replicas"
+        )
 
 
 # LocalElasticAgent source
@@ -218,6 +297,7 @@ class LocalElasticAgent(SimpleElasticAgent):
       log_line_prefix_template: Optional[str] = None,
       term_timeout: float = 600,
       use_supervisor=False,
+      supervisor_cfg: Optional[SupervisorConfig] = None,
   ):
     super().__init__(spec, exit_barrier_timeout)
     self._start_method = start_method
@@ -232,6 +312,7 @@ class LocalElasticAgent(SimpleElasticAgent):
     self._ft_cfg = fault_tol_cfg
     self._children_pgids: Set[int] = set()
     self.use_supervisor = use_supervisor
+    self.supervisor_cfg = supervisor_cfg
 
   def setup_rank_monitors(self, envs: Dict[int, Dict[str, str]]) -> None:
     spawn_mp_ctx = torch.multiprocessing.get_context("spawn")
@@ -255,12 +336,48 @@ class LocalElasticAgent(SimpleElasticAgent):
       try:
         rank = int(worker_env["RANK"])
         local_rank = int(worker_env["LOCAL_RANK"])
-        host_port = int(os.environ.get("HOST_DAEMON_PORT", 60060))
+        host_port = int(worker_env["GCP_HOST_DAEMON_PORT"])
         worker_port = host_port + local_rank + 1
+
+        # Supervisor configuration ENVs
+        workload_name = worker_env["GCP_WORKLOAD_NAME"]
+        job_name = worker_env["GCP_JOB_NAME"]
+        container_name = worker_env["GCP_CONTAINER_NAME"]
+        num_nodes_per_dp = int(worker_env["GCP_NUM_NODES_PER_DP"])
+        num_dp_replicas = int(worker_env["GCP_NUM_DP_REPLICAS"])
+        min_num_dp_replicas = int(worker_env["GCP_MIN_NUM_DP_REPLICAS"])
+        max_num_dp_replicas = int(worker_env["GCP_MAX_NUM_DP_REPLICAS"])
+        enable_workload_scaling = (
+            worker_env["GCP_ENABLE_WORKLOAD_SCALING"] == "True"
+        )
+        max_in_job_restarts = int(worker_env["GCP_MAX_IN_JOB_RESTARTS"])
+        max_workload_restarts = int(worker_env["GCP_MAX_WORKLOAD_RESTARTS"])
+        container_termination_threshold_s = int(
+            worker_env["GCP_CONTAINER_TERMINATION_THRESHOLD_S"]
+        )
+        workload_downtime_threshold_s = int(
+            worker_env["GCP_WORKLOAD_DOWNTIME_THRESHOLD_S"]
+        )
+
         import supervisor
 
         self._rank_to_gclient[rank] = supervisor.GoogleCloudResiliencyClient(
-            worker_port, host_port, local_rank, rank
+            worker_port,
+            host_port,
+            local_rank,
+            rank,
+            workload_name,
+            job_name,
+            container_name,
+            num_dp_replicas,
+            max_num_dp_replicas,
+            min_num_dp_replicas,
+            num_nodes_per_dp,
+            container_termination_threshold_s,
+            workload_downtime_threshold_s,
+            max_in_job_restarts,
+            max_workload_restarts,
+            enable_workload_scaling,
         )
         logger.info(f"setup_goodput_client at {rank=} success")
       except ImportError as e:
@@ -392,6 +509,43 @@ class LocalElasticAgent(SimpleElasticAgent):
               "TORCH_NCCL_ASYNC_ERROR_HANDLING", str(1)
           ),
       }
+      if self.use_supervisor and self.supervisor_cfg is not None:
+        worker_env["GCP_HOST_DAEMON_PORT"] = str(
+            self.supervisor_cfg.host_daemon_port
+        )
+        worker_env["GCP_CONTAINER_TERMINATION_THRESHOLD_S"] = str(
+            self.supervisor_cfg.container_termination_threshold_s
+        )
+        worker_env["GCP_WORKLOAD_DOWNTIME_THRESHOLD_S"] = str(
+            self.supervisor_cfg.workload_downtime_threshold_s
+        )
+        worker_env["GCP_WORKLOAD_NAME"] = str(self.supervisor_cfg.workload_name)
+        worker_env["GCP_JOB_NAME"] = str(self.supervisor_cfg.job_name)
+        worker_env["GCP_CONTAINER_NAME"] = str(
+            self.supervisor_cfg.container_name
+        )
+        worker_env["GCP_NUM_NODES_PER_DP"] = str(
+            self.supervisor_cfg.num_nodes_per_dp
+        )
+        worker_env["GCP_NUM_DP_REPLICAS"] = str(
+            self.supervisor_cfg.num_dp_replicas
+        )
+        worker_env["GCP_MIN_NUM_DP_REPLICAS"] = str(
+            self.supervisor_cfg.min_num_dp_replicas
+        )
+        worker_env["GCP_MAX_NUM_DP_REPLICAS"] = str(
+            self.supervisor_cfg.max_num_dp_replicas
+        )
+        worker_env["GCP_ENABLE_WORKLOAD_SCALING"] = str(
+            self.supervisor_cfg.enable_workload_scaling
+        )
+        worker_env["GCP_MAX_IN_JOB_RESTARTS"] = str(
+            self.supervisor_cfg.max_in_job_restarts
+        )
+        worker_env["GCP_MAX_WORKLOAD_RESTARTS"] = str(
+            self.supervisor_cfg.max_workload_restarts
+        )
+
       logger.info(
           f"{len(worker_group.workers)=} {worker.global_rank=} {worker.role_rank=} "
       )
@@ -605,6 +759,18 @@ class LaunchConfig:
   metrics_cfg: Dict[str, str] = field(default_factory=dict)
   local_addr: Optional[str] = None
   use_supervisor: bool = False
+  host_daemon_port: int = 61000
+  max_workload_restarts: int = 3
+  enable_workload_scaling: bool = False
+  num_nodes_per_dp: Optional[int] = None
+  min_num_dp_replicas: Optional[int] = None
+  max_num_dp_replicas: Optional[int] = None
+  num_dp_replicas: Optional[int] = None
+  container_termination_threshold_s: int = 60
+  workload_downtime_threshold_s: int = 180
+  workload_name: Optional[str] = None
+  job_name: Optional[str] = None
+  container_name: Optional[str] = None
 
   def __post_init__(self):
     default_timeout = 900
@@ -784,6 +950,25 @@ def launch_agent(
       local_addr=config.local_addr,
   )
 
+  if config.use_supervisor:
+    supervisor_cfg = SupervisorConfig(
+        host_daemon_port=config.host_daemon_port,
+        max_in_job_restarts=config.max_restarts,
+        max_workload_restarts=config.max_workload_restarts,
+        enable_workload_scaling=config.enable_workload_scaling,
+        num_nodes_per_dp=config.num_nodes_per_dp,
+        num_dp_replicas=config.num_dp_replicas,
+        min_num_dp_replicas=config.min_num_dp_replicas,
+        max_num_dp_replicas=config.max_num_dp_replicas,
+        container_termination_threshold_s=config.container_termination_threshold_s,
+        workload_downtime_threshold_s=config.workload_downtime_threshold_s,
+        workload_name=config.workload_name,
+        job_name=config.job_name,
+        container_name=config.container_name,
+    )
+  else:
+    supervisor_cfg = None
+
   agent = LocalElasticAgent(
       spec=spec,
       fault_tol_cfg=config.fault_tol_cfg,
@@ -792,6 +977,7 @@ def launch_agent(
       log_line_prefix_template=config.log_line_prefix_template,
       term_timeout=config.term_timeout,
       use_supervisor=config.use_supervisor,
+      supervisor_cfg=supervisor_cfg,
   )
   goodput_logging.log_event(
       event_type=goodput_event.JOB_STARTED,
@@ -1490,15 +1676,145 @@ def get_args_parser() -> ArgumentParser:
       ),
   )
 
+  #
+  # Supervisor related arguments
+  #
   parser.add_argument(
       "--use-supervisor",
-      "--use-supervisor",
+      "--use_supervisor",
       action="store_true",
       help=(
           "Do not raise an error if there is no Fault Tolerance pkg config"
           " provided, just use default settings."
       ),
       default=False,
+  )
+
+  parser.add_argument(
+      "--host-daemon-port",
+      "--host_daemon_port",
+      action=env,
+      type=int,
+      default=61000,
+      help=(
+          "Port on each accelerator node to be used for communication with the"
+          " supervisor."
+      ),
+  )
+
+  parser.add_argument(
+      "--max-workload-restarts",
+      "--max_workload_restarts",
+      action=env,
+      type=int,
+      default=0,
+      help=(
+          "Maximum number of workload level restarts before a failure is"
+          " considered fatal."
+      ),
+  )
+
+  parser.add_argument(
+      "--enable-workload-scaling",
+      "--enable_workload_scaling",
+      action="store_true",
+      help="Whether to enable workload data replica scaling.",
+      default=False,
+  )
+
+  parser.add_argument(
+      "--num-nodes-per-dp",
+      "--num_nodes_per_dp",
+      action=env,
+      type=int,
+      default=0,
+      help="Number of accelerator nodes per data replica.",
+  )
+
+  parser.add_argument(
+      "--num-dp-replicas",
+      "--num_dp_replicas",
+      action=env,
+      type=int,
+      default=0,
+      help="Number of data replicas to use for the workload.",
+  )
+
+  parser.add_argument(
+      "--min-num-dp-replicas",
+      "--min_num_dp_replicas",
+      action=env,
+      type=int,
+      default=0,
+      help=(
+          "Minimum number of data replicas to use for the workload. Used to"
+          " determine whether scale down is possible."
+      ),
+  )
+
+  parser.add_argument(
+      "--max-num-dp-replicas",
+      "--max_num_dp_replicas",
+      action=env,
+      type=int,
+      default=0,
+      help=(
+          "Maximum number of data replicas to use for the workload. Used to"
+          " determine whether scale up is possible."
+      ),
+  )
+
+  parser.add_argument(
+      "--container-termination-threshold-s",
+      "--container_termination_threshold_s",
+      action=env,
+      type=int,
+      default=0,
+      help=(
+          "Threshold in seconds for container termination. If a container is a"
+          " terminating state for longer than this threshold, it is force"
+          " deleted by the Supervisor."
+      ),
+  )
+
+  parser.add_argument(
+      "--workload-downtime-threshold-s",
+      "--workload_downtime_threshold_s",
+      action=env,
+      type=int,
+      default=0,
+      help=(
+          "Threshold in seconds for workload downtime. If the workload is down"
+          " for longer than this threshold, it is recreated by the"
+          " Supervisor."
+      ),
+  )
+
+  parser.add_argument(
+      "--job-name",
+      "--job_name",
+      action=env,
+      type=str,
+      default=None,
+      help="Name of the job.",
+  )
+
+  parser.add_argument(
+      "--container-name",
+      "--container_name",
+      action=env,
+      type=str,
+      default=None,
+      help="Name of the container.",
+  )
+
+  parser.add_argument(
+      "--workload-name",
+      "--workload_name",
+      action=env,
+      type=str,
+      default=None,
+      help="Name of the workload.",
   )
 
   #
@@ -1776,6 +2092,24 @@ def config_from_args(
       local_ranks_filter=ranks,
   )
 
+  if args.use_supervisor:
+    if max_nodes > min_nodes:
+      raise ValueError(
+          "Google Cloud Resiliency Supervisor is incompatible with torchelastic"
+          " scaling. Please disable torchelastic scaling by setting --nnodes to"
+          " a single value."
+      )
+
+    if max_nodes % args.num_nodes_per_dp != 0:
+      raise ValueError(
+          "nnodes must be a multiple of num_nodes_per_dp when using Google"
+          " Cloud Resiliency Supervisor."
+      )
+
+    num_dp_replicas = max_nodes // args.num_nodes_per_dp
+  else:
+    num_dp_replicas = None
+
   config = LaunchConfig(
       min_nodes=min_nodes,
       max_nodes=max_nodes,
@@ -1794,6 +2128,18 @@ def config_from_args(
       logs_specs=logs_specs,
       fault_tol_cfg=fault_tol_cfg,
       use_supervisor=args.use_supervisor,
+      host_daemon_port=args.host_daemon_port,
+      max_workload_restarts=args.max_workload_restarts,
+      enable_workload_scaling=args.enable_workload_scaling,
+      num_nodes_per_dp=args.num_nodes_per_dp,
+      min_num_dp_replicas=args.min_num_dp_replicas,
+      max_num_dp_replicas=args.max_num_dp_replicas,
+      num_dp_replicas=num_dp_replicas,
+      container_termination_threshold_s=args.container_termination_threshold_s,
+      workload_downtime_threshold_s=args.workload_downtime_threshold_s,
+      workload_name=args.workload_name,
+      job_name=args.job_name,
+      container_name=args.container_name,
   )
 
   with_python = not args.no_python

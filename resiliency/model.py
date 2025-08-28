@@ -79,7 +79,9 @@ class ModelConfig:
 
     self.parallel_configs["36MReplicatedOpt"] = ParallelConfig(tp=4, pp=2, vp=3)
     self.parallel_configs["70BReplicatedOpt"] = ParallelConfig(tp=8, pp=4, vp=4)
-    self.parallel_configs["405BReplicatedOpt"] = ParallelConfig(tp=8, pp=18, vp=7)
+    self.parallel_configs["405BReplicatedOpt"] = ParallelConfig(
+        tp=8, pp=18, vp=7
+    )
 
     # Communication overlap callback configurations
     self.comm_overlap_configs = {
