@@ -243,6 +243,48 @@ class LocalElasticAgent(SimpleElasticAgent):
         self._ft_cfg = fault_tol_cfg
         self._children_pgids: Set[int] = set()
         self._restart_policy = restart_policy
+        self._rank_to_gclient: Dict[int, Any] = dict()
+
+    def _setup_goodput_client(self, envs: Dict[int, Dict[str, str]]) -> None:
+
+        for worker_env in envs.values():
+            if worker_env.get('GCP_HOST_DAEMON_PORT') is None:
+                logger.info(f"Not set up goodput client as GCP_HOST_DAEMON_PORT is not set.")
+                return
+            try:
+                rank = int(worker_env["RANK"])
+                local_rank = int(worker_env["LOCAL_RANK"])
+                host_port = int(worker_env["GCP_HOST_DAEMON_PORT"])
+                worker_port = host_port + local_rank + 1
+                import supervisor
+
+                self._rank_to_gclient[rank] = supervisor.GoogleCloudResiliencyClient(
+                    worker_port,
+                    host_port,
+                    local_rank,
+                    rank,
+                    workload_name=os.environ.get('JOB_IDENTIFIER', 'training_job'))
+                logger.info(f"setup_goodput_client at {rank=} success")
+            except ImportError as e:
+                logger.info(f"setup_goodput_client at {rank=} fail")
+                self._rank_to_gclient[rank] = None
+
+    def _update_gclient_state(self, global_rank, worker_state):
+        """
+        Uses pytorch WorkerState to update gclient state.
+        """
+        if self._rank_to_gclient is None or self._rank_to_gclient.get(global_rank) is None:
+            return
+        from supervisor import DeviceState
+        worker_state_to_device_state = {
+            WorkerState.FAILED: DeviceState.FAILED,
+            WorkerState.HEALTHY: DeviceState.RUNNING,
+            WorkerState.SUCCEEDED: DeviceState.COMPLETE,
+        }
+        assert worker_state in worker_state_to_device_state
+        self._rank_to_gclient[global_rank].update_state(worker_state_to_device_state[worker_state])
+
+
 
     DEFAULT_ROLE = "default"  # FIXME
 
@@ -614,6 +656,9 @@ class LocalElasticAgent(SimpleElasticAgent):
             if "OMP_NUM_THREADS" in os.environ:
                 worker_env["OMP_NUM_THREADS"] = os.environ["OMP_NUM_THREADS"]
 
+            if "GCP_HOST_DAEMON_PORT" in os.environ:
+                worker_env["GCP_HOST_DAEMON_PORT"] = os.environ["GCP_HOST_DAEMON_PORT"]
+
             if self._log_line_prefix_template:
                 log_line_prefix = Template(self._log_line_prefix_template).safe_substitute(
                     role_name=spec.role,
@@ -630,6 +675,8 @@ class LocalElasticAgent(SimpleElasticAgent):
         self._setup_local_watchdog(envs=envs)
 
         self.setup_rank_monitors(envs=envs)
+
+        self._setup_goodput_client(envs=envs)
 
         assert spec.entrypoint is not None
         assert self._logs_specs is not None
@@ -687,6 +734,7 @@ class LocalElasticAgent(SimpleElasticAgent):
                 for local_rank, failure in result.failures.items():
                     worker = worker_group.workers[local_rank]
                     worker_failures[worker.global_rank] = failure
+                    self._update_gclient_state(worker.global_rank, WorkerState.FAILED)
                 all_failed = len(result.failures) == len(worker_pids)
                 if all_failed:
                     run_result = RunResult(
@@ -707,11 +755,15 @@ class LocalElasticAgent(SimpleElasticAgent):
                 for local_rank, ret_val in result.return_values.items():
                     worker = worker_group.workers[local_rank]
                     workers_ret_vals[worker.global_rank] = ret_val
+                    self._update_gclient_state(worker.global_rank, WorkerState.SUCCEEDED)
+
                 return RunResult(
                     state=WorkerState.SUCCEEDED,
                     return_values=workers_ret_vals,
                 )
         else:
+            for global_rank in self._rank_to_gclient.keys():
+                self._update_gclient_state(global_rank, WorkerState.HEALTHY)
             return RunResult(state=WorkerState.HEALTHY)
 
     def any_rank_failed(self) -> bool:

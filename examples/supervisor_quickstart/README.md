@@ -138,7 +138,7 @@ COPY local_elastic_agent.patch /tmp/local_elastic_agent.patch
 RUN patch ${TORCH_AGENT_PATH} < /tmp/local_elastic_agent.patch
 
 # Install gcp resiliency library
-RUN pip install ./gcp_resiliency_supervisor-1.0.4-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
+RUN pip install ./gcp_resiliency_supervisor-1.0.5-cp310-cp310-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
 ```
 
 Note: This example assumes a Python 3.10 environment. The path to local_elastic_agent.py might differ slightly based on your Python version or base image. The ARG command dynamically finds the correct path.
