@@ -1,0 +1,30 @@
+--- a/examples/goodput_measurement/fsdp_example.py
++++ b/examples/goodput_measurement/fsdp_example.py
+@@ -11,6 +11,9 @@ from torch.distributed.checkpoint.stateful import Stateful
+ from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
+ from torch.distributed.fsdp import fully_shard
+
++from resiliency.goodput_measure import logging as goodput_logging
++from resiliency.goodput_measure import constant as goodput_event
++
+ # --- Configuration ---
+ CHECKPOINT_DIR = "my_fsdp_checkpoint"
+ MAX_STEPS = 10000
+@@ -127,6 +130,9 @@ def run_training():
+         if rank == 0:
+             print("No valid checkpoint subfolders found. Starting training from scratch.")
+
++    if rank == 0:
++        goodput_logging.log_event(goodput_event.CHECKPOINT_LOADED, step=start_step)
++
+     # 4. Training Loop
+     last_time, last_step = time.time(), start_step
+     for step in range(start_step, MAX_STEPS):
+@@ -160,6 +166,7 @@ def run_training():
+             )
+
+             if rank == 0:
++                goodput_logging.log_event(goodput_event.CHECKPOINT_SAVED, step=app_state.step)
+                 print("Checkpoint saved successfully.\n")
+
+     cleanup()

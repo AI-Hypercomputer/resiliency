@@ -981,7 +981,7 @@ def launch_agent(
   )
   goodput_logging.log_event(
       event_type=goodput_event.JOB_STARTED,
-      node_rank=config.rdzv_configs.get("rank"),
+      node_rank=int(os.environ.get("NODE_RANK")),
   )
 
   shutdown_rdzv = True
@@ -1032,7 +1032,7 @@ def launch_agent(
     agent.shutdown_rank_monitors()
     goodput_logging.log_event(
         event_type=goodput_event.JOB_TERMINATED,
-        node_rank=config.rdzv_configs.get("rank"),
+        node_rank=int(os.environ.get("NODE_RANK")),
     )
 
 

@@ -88,6 +88,9 @@ from nvidia_resiliency_ext.fault_tolerance.utils import (
     write_obj_to_ipc_stream,
 )
 
+from resiliency.goodput_measure import constant as goodput_event
+from resiliency.goodput_measure import logging as goodput_logging
+
 logging.basicConfig(
     level=os.getenv('FT_LAUNCHER_LOGLEVEL', 'INFO'),
     format=f"[%(asctime)s] [%(levelname)s] [ft_launcher{os.getpid()}@{socket.gethostname()}] %(message)s",
@@ -1059,6 +1062,10 @@ def launch_agent(
         restart_policy=config.restart_policy,
         is_store_host=_is_store_host(rdzv_parameters),
     )
+    goodput_logging.log_event(
+      event_type=goodput_event.JOB_STARTED,
+      node_rank=int(os.environ.get("NODE_RANK")),
+    )
 
     shutdown_rdzv = True
     try:
@@ -1110,6 +1117,10 @@ def launch_agent(
         raise
     finally:
         agent.clean_rdzv_shutdown(close=shutdown_rdzv)
+        goodput_logging.log_event(
+            event_type=goodput_event.JOB_TERMINATED,
+            node_rank=int(os.environ.get("NODE_RANK")),
+        )
         agent.shutdown_rank_monitors()
         with contextlib.suppress(Exception):
             os.unlink(FT_LAUNCHER_IPC_SOCKET)
